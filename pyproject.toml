@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dupesweep"
+dynamic = ["version"]
+description = "Fast duplicate file finder and cleaner for the command line."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Dans-Vsa" }]
+requires-python = ">=3.10"
+dependencies = []
+keywords = ["duplicates", "files", "cli", "cleanup", "hashing"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Filesystems",
+    "Topic :: Utilities",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+dupesweep = "dupesweep.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "dupesweep.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
