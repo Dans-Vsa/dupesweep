@@ -5,7 +5,7 @@ reclaiming wasted disk space. It walks your folders, groups files by size,
 confirms duplicates by content hash, and (soon) lets you safely delete,
 hard-link or quarantine the extra copies.
 
-> Status: **early development** — milestone 2 of 6 (duplicate engine + `find` command) is done.
+> Status: **early development** — milestone 3 of 6 (reports + export) is done.
 
 ## Features
 
@@ -17,7 +17,8 @@ hard-link or quarantine the extra copies.
 - [x] `scan` command: file count, total size, largest files, text or JSON output
 - [x] Duplicate detection: size → partial hash (first + last 64 KB) → full BLAKE2b hash
 - [x] `find` command: duplicate groups, redundant copies and wasted space, text or JSON
-- [ ] Reports: duplicate groups, wasted space, JSON / CSV export
+- [x] Reports: sort (`--sort wasted|size|count|path`), `--limit`, summary with wasted space per file type, JSON / CSV export (`--format`, `--output`)
+- [x] `--fail-on-dupes`: exit status 1 when duplicates exist (handy in CI or cron jobs)
 - [ ] Clean-up actions: delete, hard-link or move duplicates, with keep rules
       (oldest, newest, shortest path, inside a folder) and dry-run by default
 - [ ] Hash cache (SQLite) and parallel hashing with progress output
@@ -54,6 +55,9 @@ dupesweep scan . --exclude-dir build --exclude-dir dist
 # Find duplicates (same filters as scan)
 dupesweep find ~/Pictures ~/Backups/Pictures --min-size 1MB
 dupesweep find . --json > dupes.json
+dupesweep find ~/Music --sort count --limit 20          # groups with the most copies
+dupesweep find ~/Data -o reports/dupes.csv             # one CSV row per file
+dupesweep find ./assets --fail-on-dupes --min-size 10KB  # fail a CI job on duplicates
 
 # Also works without installing the script
 python -m dupesweep scan . 
@@ -85,6 +89,18 @@ Group 2: 3 files x 5 B  (10 B wasted)
 Found 2 duplicate group(s): 3 redundant file(s), 293.0 KB wasted (scanned 6 files).
 ```
 
+### Reports and export
+
+| Option | Effect |
+|---|---|
+| `--sort wasted` (default) / `size` / `count` / `path` | Order of the groups |
+| `--limit N` | List only the first N groups (the summary still covers all of them) |
+| `--format text\|json\|csv`, `--json` | Output format |
+| `-o FILE` | Write to a file; the format follows the suffix (`.json`, `.csv`, `.txt`) |
+| `--fail-on-dupes` | Exit with status 1 if any duplicate group was found |
+
+The text report ends with a breakdown such as `Wasted by type: .jpg 1.2 GB, .mp4 800.0 MB`. CSV has the columns `group,size,count,wasted,digest,path,mtime` — one row per file.
+
 ### How duplicates are confirmed
 
 1. **Size** — files with a unique size cannot have a twin and are never opened.
@@ -111,6 +127,7 @@ dupesweep/
 │   ├── cli.py          # argparse commands
 │   ├── finder.py       # size -> partial -> full hash grouping
 │   ├── hasher.py       # partial and full BLAKE2b hashing
+│   ├── report.py       # sorting, summary, JSON/CSV export
 │   ├── scanner.py      # filesystem walker + filters
 │   └── sizes.py        # parse/format human-readable sizes
 ├── tests/              # pytest suite
