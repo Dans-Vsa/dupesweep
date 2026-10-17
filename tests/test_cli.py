@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 import subprocess
 import sys
@@ -125,3 +127,53 @@ def test_find_without_duplicates(tmp_path, capsys):
 
 def test_find_min_larger_than_max(dupes, capsys):
     assert main(["find", str(dupes), "--min-size", "2KB", "--max-size", "1KB"]) == 2
+
+
+def test_find_sort_and_limit(dupes, capsys):
+    assert main(["find", str(dupes), "--sort", "count", "--limit", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "Group 1: 3 files x 12 B" in out
+    assert "Group 2" not in out
+    assert "Showing 1 of 2 groups (--limit)." in out
+    assert "Wasted by type: .jpg 400 B, .txt 24 B" in out
+
+
+def test_find_json_summary_covers_all_groups(dupes, capsys):
+    assert main(["find", str(dupes), "--json", "--limit", "1"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert len(data["duplicates"]) == 1
+    assert data["summary"]["groups"] == 2
+    assert data["summary"]["wasted_by_extension"] == {".jpg": 400, ".txt": 24}
+    assert data["limit"] == 1 and data["sort"] == "wasted"
+
+
+def test_find_csv_to_stdout(dupes, capsys):
+    assert main(["find", str(dupes), "--format", "csv"]) == 0
+    rows = list(csv.DictReader(io.StringIO(capsys.readouterr().out)))
+    assert len(rows) == 5
+    assert rows[0]["group"] == "1" and rows[0]["wasted"] == "400"
+
+
+def test_find_output_file_infers_format(dupes, tmp_path, capsys):
+    target = tmp_path / "out" / "report.json"
+    assert main(["find", str(dupes), "-o", str(target)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Wrote json report" in captured.err
+    assert json.loads(target.read_text(encoding="utf-8"))["groups"] == 2
+
+
+def test_find_output_unknown_suffix(dupes, tmp_path, capsys):
+    assert main(["find", str(dupes), "-o", str(tmp_path / "r.md")]) == 2
+    assert "cannot tell the format" in capsys.readouterr().err
+
+
+def test_find_fail_on_dupes(dupes, tmp_path, capsys):
+    assert main(["find", str(dupes), "--fail-on-dupes"]) == 1
+    (tmp_path / "solo").mkdir()
+    (tmp_path / "solo" / "a").write_text("only one")
+    assert main(["find", str(tmp_path / "solo"), "--fail-on-dupes"]) == 0
+
+
+def test_find_invalid_limit(dupes, capsys):
+    assert main(["find", str(dupes), "--limit", "0"]) == 2
