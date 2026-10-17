@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
 from dupesweep import __version__
-from dupesweep import report
+from dupesweep import cleaner, report
 from dupesweep.finder import DuplicateGroup, FindStats, find_duplicates
 from dupesweep.scanner import ScanOptions, ScanStats, iter_files
 from dupesweep.sizes import format_size, parse_size
@@ -68,7 +69,7 @@ def _options_from_args(args: argparse.Namespace) -> ScanOptions:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dupesweep",
-        description="Find (and soon clean up) duplicate files.",
+        description="Find and safely clean up duplicate files.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -103,6 +104,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="exit with status 1 when duplicates are found (useful in CI)",
     )
     find.set_defaults(func=cmd_find)
+
+    clean = sub.add_parser(
+        "clean", help="remove, hard-link or quarantine duplicates (dry run unless --yes)"
+    )
+    _add_scan_filters(clean)
+    clean.add_argument(
+        "--action", choices=cleaner.ACTIONS, default="quarantine",
+        help="what to do with the extra copies (default: quarantine = move them away)",
+    )
+    clean.add_argument(
+        "--keep", choices=cleaner.KEEP_RULES, default="first",
+        help="which copy to keep: first (A-Z path), oldest, newest, shortest or longest path",
+    )
+    clean.add_argument(
+        "--keep-in", action="append", default=[], metavar="DIR",
+        help="prefer keeping copies inside DIR (repeatable)",
+    )
+    clean.add_argument(
+        "--quarantine-dir", default="dupesweep-quarantine", metavar="DIR",
+        help="where quarantined files go (default: ./dupesweep-quarantine)",
+    )
+    clean.add_argument(
+        "--log", metavar="FILE",
+        help="undo log to append to (default: dupesweep-log-<timestamp>.jsonl in the "
+        "quarantine dir, or the current dir for other actions)",
+    )
+    clean.add_argument("-y", "--yes", action="store_true", help="actually apply the changes")
+    clean.set_defaults(func=cmd_clean)
+
+    undo = sub.add_parser("undo", help="restore files recorded in a clean log")
+    undo.add_argument("log", help="the .jsonl log written by clean")
+    undo.add_argument("-y", "--yes", action="store_true", help="actually restore the files")
+    undo.set_defaults(func=cmd_undo)
     return parser
 
 
@@ -269,6 +303,98 @@ def cmd_find(args: argparse.Namespace) -> int:
     if args.fail_on_dupes and summary.groups:
         return 1
     return 0
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    if not _check_size_range(args):
+        return 2
+    keep_in = [Path(d) for d in args.keep_in]
+    for folder in keep_in:
+        if not folder.is_dir():
+            print(f"error: --keep-in folder does not exist: {folder}", file=sys.stderr)
+            return 2
+    quarantine_dir = Path(args.quarantine_dir)
+    scan_stats, find_stats, groups = _scan_and_find(args)
+    if args.action == "quarantine":
+        # Never treat files that are already quarantined as candidates.
+        groups = [g for g in groups if not any(_inside(f.path, quarantine_dir) for f in g.files)]
+    plans = cleaner.make_plan(groups, args.keep, keep_in)
+    freed = sum(p.freed for p in plans)
+    count = sum(len(p.remove) for p in plans)
+    errors = scan_stats.errors + find_stats.errors
+
+    if not plans:
+        print(f"No duplicates found (scanned {scan_stats.files} files). Nothing to clean.")
+        _print_errors(errors)
+        return 0
+
+    verb = {"quarantine": "move to quarantine", "hardlink": "hard-link", "delete": "DELETE"}
+    for number, plan in enumerate(plans, start=1):
+        print(f"Group {number} ({format_size(plan.group.size)} each):")
+        print(f"  {'keep':<10} {plan.keep.path}")
+        for dup in plan.remove:
+            print(f"  {args.action:<10} {dup.path}")
+    print()
+
+    if not args.yes:
+        print(
+            f"Dry run: would {verb[args.action]} {count} file(s) and free "
+            f"{format_size(freed)}. Re-run with --yes to apply."
+        )
+        _print_errors(errors)
+        return 0
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    if args.log:
+        log_path = Path(args.log)
+    elif args.action == "quarantine":
+        log_path = quarantine_dir / f"dupesweep-log-{stamp}.jsonl"
+    else:
+        log_path = Path(f"dupesweep-log-{stamp}.jsonl")
+    result = cleaner.apply_plan(
+        plans, args.action, quarantine_dir=quarantine_dir, log_path=log_path
+    )
+    for outcome in result.failed:
+        print(f"skipped {outcome.path}: {outcome.message}", file=sys.stderr)
+    print(
+        f"Done: {len(result.done)} file(s) handled with {args.action}, "
+        f"{format_size(result.freed)} freed, {len(result.failed)} skipped."
+    )
+    if result.done:
+        undo_hint = "" if args.action == "delete" else f" (undo: dupesweep undo {log_path} --yes)"
+        print(f"Log: {log_path}{undo_hint}")
+    _print_errors(errors)
+    return 1 if result.failed else 0
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    try:
+        path.resolve().relative_to(folder.resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def cmd_undo(args: argparse.Namespace) -> int:
+    log_path = Path(args.log)
+    try:
+        records = cleaner.read_log(log_path)
+    except (OSError, ValueError) as exc:
+        print(f"error: cannot read log: {exc}", file=sys.stderr)
+        return 2
+    outcomes = cleaner.undo(records, dry_run=not args.yes)
+    for outcome in outcomes:
+        status = "restored" if outcome.ok else "skipped "
+        if not args.yes and outcome.ok:
+            status = "would restore"
+        line = f"{status} {outcome.path}"
+        print(line if outcome.ok else f"{line}: {outcome.message}")
+    ok = sum(o.ok for o in outcomes)
+    if args.yes:
+        print(f"Restored {ok} of {len(outcomes)} file(s).")
+    else:
+        print(f"Dry run: {ok} of {len(outcomes)} file(s) can be restored. Re-run with --yes.")
+    return 0 if ok == len(outcomes) else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
