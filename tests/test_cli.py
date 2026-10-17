@@ -177,3 +177,71 @@ def test_find_fail_on_dupes(dupes, tmp_path, capsys):
 
 def test_find_invalid_limit(dupes, capsys):
     assert main(["find", str(dupes), "--limit", "0"]) == 2
+
+
+def files_in(root):
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+
+
+def test_clean_is_a_dry_run_by_default(dupes, capsys):
+    before = files_in(dupes)
+    assert main(["clean", str(dupes)]) == 0
+    out = capsys.readouterr().out
+    assert "Dry run: would move to quarantine 3 file(s)" in out
+    assert "--yes" in out
+    assert files_in(dupes) == before
+
+
+def test_clean_quarantine_then_undo(dupes, tmp_path_factory, capsys, monkeypatch):
+    out_dir = tmp_path_factory.mktemp("out")  # outside the scanned tree
+    monkeypatch.chdir(out_dir)
+    q = out_dir / "q"
+    assert main(["clean", str(dupes), "--yes", "--quarantine-dir", str(q),
+                 "--keep-in", str(dupes / "backup")]) == 0
+    out = capsys.readouterr().out
+    assert "Done: 3 file(s) handled with quarantine" in out
+    # --keep-in wins for the photo; the text group keeps the first path A-Z.
+    assert files_in(dupes) == ["backup/photo.jpg", "nested/three.txt", "other.txt"]
+    logs = list(q.glob("dupesweep-log-*.jsonl"))
+    assert len(logs) == 1
+
+    assert main(["undo", str(logs[0])]) == 0
+    assert "Dry run: 3 of 3 file(s) can be restored" in capsys.readouterr().out
+    assert main(["undo", str(logs[0]), "--yes"]) == 0
+    assert "Restored 3 of 3 file(s)." in capsys.readouterr().out
+    assert "photo.jpg" in files_in(dupes) and "one.txt" in files_in(dupes)
+
+
+def test_clean_delete_with_keep_rule_and_custom_log(dupes, tmp_path_factory, capsys):
+    log = tmp_path_factory.mktemp("logs") / "clean.jsonl"
+    assert main(["clean", str(dupes), "--action", "delete", "--keep", "longest",
+                 "--log", str(log), "-y"]) == 0
+    assert files_in(dupes) == ["backup/photo.jpg", "nested/three.txt", "other.txt"]
+    assert len(log.read_text(encoding="utf-8").splitlines()) == 3
+    out = capsys.readouterr().out
+    assert "undo:" not in out  # deletions cannot be undone
+
+
+def test_clean_hardlink(dupes, tmp_path_factory, capsys):
+    log = tmp_path_factory.mktemp("logs") / "l.jsonl"
+    assert main(["clean", str(dupes), "--action", "hardlink", "--log", str(log), "--yes"]) == 0
+    one, two = (dupes / "one.txt").stat(), (dupes / "two.txt").stat()
+    assert one.st_ino == two.st_ino
+    assert len(files_in(dupes)) == 6
+
+
+def test_clean_nothing_to_do(tmp_path, capsys):
+    (tmp_path / "a").write_text("alone")
+    assert main(["clean", str(tmp_path), "--yes"]) == 0
+    assert "Nothing to clean." in capsys.readouterr().out
+
+
+def test_clean_rejects_missing_keep_in(dupes, tmp_path, capsys):
+    assert main(["clean", str(dupes), "--keep-in", str(tmp_path / "nope")]) == 2
+
+
+def test_undo_bad_log(tmp_path, capsys):
+    assert main(["undo", str(tmp_path / "missing.jsonl")]) == 2
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text("{nope")
+    assert main(["undo", str(bad)]) == 2
