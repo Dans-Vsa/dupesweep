@@ -6,8 +6,10 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from dupesweep import __version__
+from dupesweep import report
 from dupesweep.finder import DuplicateGroup, FindStats, find_duplicates
 from dupesweep.scanner import ScanOptions, ScanStats, iter_files
 from dupesweep.sizes import format_size, parse_size
@@ -81,7 +83,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     find = sub.add_parser("find", help="list groups of duplicate files and the space they waste")
     _add_scan_filters(find)
-    find.add_argument("--json", action="store_true", help="print the groups as JSON")
+    find.add_argument(
+        "--sort", choices=report.SORT_KEYS, default="wasted",
+        help="order of the groups (default: wasted space)",
+    )
+    find.add_argument(
+        "--limit", type=int, default=None, metavar="N", help="only list the first N groups"
+    )
+    find.add_argument(
+        "-f", "--format", choices=report.FORMATS, default=None,
+        help="output format (default: text, or from the --output suffix)",
+    )
+    find.add_argument("--json", action="store_true", help="shortcut for --format json")
+    find.add_argument(
+        "-o", "--output", metavar="FILE", help="write the report to FILE (.json or .csv)"
+    )
+    find.add_argument(
+        "--fail-on-dupes", action="store_true",
+        help="exit with status 1 when duplicates are found (useful in CI)",
+    )
     find.set_defaults(func=cmd_find)
     return parser
 
@@ -143,30 +163,78 @@ def _scan_and_find(args: argparse.Namespace) -> tuple[ScanStats, FindStats, list
     return scan_stats, find_stats, groups
 
 
-def _print_group(number: int, group: DuplicateGroup) -> None:
-    print(
-        f"Group {number}: {group.count} files x {format_size(group.size)}"
-        f"  ({format_size(group.wasted)} wasted)"
-    )
-    for entry in group.files:
-        print(f"  {entry.path}")
+def _report_format(args: argparse.Namespace) -> str | None:
+    """Resolve --json / --format / --output suffix; ``None`` means a usage error."""
+    if args.json:
+        return "json"
+    if args.format:
+        return args.format
+    if args.output:
+        suffix = Path(args.output).suffix.lower()
+        guessed = {".json": "json", ".csv": "csv", ".txt": "text"}.get(suffix)
+        if guessed is None:
+            print(
+                f"error: cannot tell the format of {args.output!r}; pass --format json|csv|text",
+                file=sys.stderr,
+            )
+        return guessed
+    return "text"
+
+
+def _render_text(
+    groups: list[DuplicateGroup], summary: report.Summary, scanned: int, total_groups: int
+) -> str:
+    lines: list[str] = []
+    for number, group in enumerate(groups, start=1):
+        lines.append(
+            f"Group {number}: {group.count} files x {format_size(group.size)}"
+            f"  ({format_size(group.wasted)} wasted)"
+        )
+        lines.extend(f"  {entry.path}" for entry in group.files)
+        lines.append("")
+    if summary.groups:
+        lines.append(
+            f"Found {summary.groups} duplicate group(s): {summary.duplicate_files} redundant "
+            f"file(s), {format_size(summary.wasted_bytes)} wasted (scanned {scanned} files)."
+        )
+        if len(groups) < total_groups:
+            lines.append(f"Showing {len(groups)} of {total_groups} groups (--limit).")
+        top = list(summary.by_extension.items())[:5]
+        if len(summary.by_extension) > 1:
+            lines.append(
+                "Wasted by type: "
+                + ", ".join(f"{ext} {format_size(size)}" for ext, size in top)
+            )
+    else:
+        lines.append(f"No duplicates found (scanned {scanned} files).")
+    return "\n".join(lines) + "\n"
 
 
 def cmd_find(args: argparse.Namespace) -> int:
     if not _check_size_range(args):
         return 2
+    if args.limit is not None and args.limit < 1:
+        print("error: --limit must be at least 1", file=sys.stderr)
+        return 2
+    fmt = _report_format(args)
+    if fmt is None:
+        return 2
+
     scan_stats, find_stats, groups = _scan_and_find(args)
     errors = scan_stats.errors + find_stats.errors
-    wasted = sum(g.wasted for g in groups)
-    duplicate_files = sum(g.count - 1 for g in groups)
+    groups = report.sort_groups(groups, args.sort)
+    summary = report.summarize(groups)
+    shown = groups[: args.limit] if args.limit else groups
 
-    if args.json:
-        payload = {
+    if fmt == "json":
+        extra = {
             "scanned_files": scan_stats.files,
             "scanned_bytes": scan_stats.bytes,
-            "groups": len(groups),
-            "duplicate_files": duplicate_files,
-            "wasted_bytes": wasted,
+            "groups": summary.groups,
+            "duplicate_files": summary.duplicate_files,
+            "wasted_bytes": summary.wasted_bytes,
+            "sort": args.sort,
+            "limit": args.limit,
             "hashing": {
                 "size_candidates": find_stats.size_candidates,
                 "partial_hashed": find_stats.partial_hashed,
@@ -174,22 +242,32 @@ def cmd_find(args: argparse.Namespace) -> int:
                 "bytes_fully_hashed": find_stats.bytes_hashed,
             },
             "errors": errors,
-            "duplicates": [g.to_dict() for g in groups],
         }
-        print(json.dumps(payload, indent=2))
-        return 0
+        text = report.to_json(shown, summary, extra)
+    elif fmt == "csv":
+        text = report.to_csv(shown)
+    else:
+        text = _render_text(shown, summary, scan_stats.files, len(groups))
 
-    for number, group in enumerate(groups, start=1):
-        _print_group(number, group)
-        print()
-    if groups:
+    if args.output:
+        try:
+            out = Path(args.output)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(text, encoding="utf-8", newline="")
+        except OSError as exc:
+            print(f"error: cannot write {args.output}: {exc}", file=sys.stderr)
+            return 1
         print(
-            f"Found {len(groups)} duplicate group(s): {duplicate_files} redundant file(s), "
-            f"{format_size(wasted)} wasted (scanned {scan_stats.files} files)."
+            f"Wrote {fmt} report to {args.output}: {summary.groups} group(s), "
+            f"{format_size(summary.wasted_bytes)} wasted.",
+            file=sys.stderr,
         )
     else:
-        print(f"No duplicates found (scanned {scan_stats.files} files).")
+        sys.stdout.write(text)
+
     _print_errors(errors)
+    if args.fail_on_dupes and summary.groups:
+        return 1
     return 0
 
 
