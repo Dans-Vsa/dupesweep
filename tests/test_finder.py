@@ -87,3 +87,33 @@ def test_to_dict(dupe_tree):
     d = find_duplicates(iter_files([dupe_tree]))[1].to_dict()
     assert d["count"] == 3 and d["wasted"] == 10 and d["size"] == 5
     assert [Path(p).name for p in d["files"]] == ["a.txt", "b.txt", "c.txt"]
+
+
+def test_parallel_hashing_gives_the_same_result(dupe_tree):
+    serial = find_duplicates(iter_files([dupe_tree]), jobs=1)
+    parallel = find_duplicates(iter_files([dupe_tree]), jobs=4)
+    assert serial == parallel
+
+
+def test_progress_callback(dupe_tree):
+    events = []
+    find_duplicates(iter_files([dupe_tree]), jobs=2,
+                    progress=lambda stage, done, total: events.append((stage, done, total)))
+    partial = [e for e in events if e[0] == "partial"]
+    full = [e for e in events if e[0] == "full"]
+    assert partial[0] == ("partial", 0, 7) and partial[-1] == ("partial", 7, 7)
+    assert full[-1] == ("full", 3, 3)
+    assert [d for _, d, _ in partial] == sorted(d for _, d, _ in partial)
+
+
+def test_parallel_errors_are_collected(dupe_tree):
+    def flaky(entry):
+        if entry.path.name == "big1.bin":
+            raise OSError(5, "I/O error")
+        return "x"
+
+    stats = FindStats()
+    groups = find_duplicates(iter_files([dupe_tree]), stats, full=flaky, jobs=3)
+    assert any("big1.bin" in e for e in stats.errors)
+    # big2 and big3 now "match" via the fake hash; big1 dropped out.
+    assert ["big3.bin", "big2.bin"] in [names(g) for g in groups]
