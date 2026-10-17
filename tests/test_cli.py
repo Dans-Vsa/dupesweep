@@ -245,3 +245,37 @@ def test_undo_bad_log(tmp_path, capsys):
     bad = tmp_path / "bad.jsonl"
     bad.write_text("{nope")
     assert main(["undo", str(bad)]) == 2
+
+
+def test_find_with_cache_and_jobs(dupes, tmp_path_factory, capsys):
+    cache = tmp_path_factory.mktemp("cache") / "h.sqlite"
+    args = ["find", str(dupes), "--json", "--cache", str(cache), "-j", "3"]
+    assert main(args) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert main(args) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert first["hashing"]["cache_hits"] == 0
+    assert second["hashing"]["cache_hits"] == 6  # all six same-size files are small
+    assert first["duplicates"] == second["duplicates"]
+
+    assert main(["cache", "info", "--cache", str(cache)]) == 0
+    assert "Entries: 6" in capsys.readouterr().out
+    assert main(["cache", "prune", "--cache", str(cache)]) == 0
+    assert "Removed 0 entries" in capsys.readouterr().out
+    assert main(["cache", "clear", "--cache", str(cache)]) == 0
+    assert main(["cache", "info", "--cache", str(cache)]) == 0
+    assert "Entries: 0" in capsys.readouterr().out
+
+
+def test_cache_info_without_cache(tmp_path, capsys):
+    assert main(["cache", "info", "--cache", str(tmp_path / "none.sqlite")]) == 0
+    assert "No cache at" in capsys.readouterr().out
+
+
+def test_progress_goes_to_stderr(dupes, capsys):
+    assert main(["find", str(dupes), "--progress"]) == 0
+    captured = capsys.readouterr()
+    assert "hashing partial" in captured.err and "6/6" in captured.err
+    assert "hashing" not in captured.out
+    assert main(["find", str(dupes), "--no-progress"]) == 0
+    assert "hashing" not in capsys.readouterr().err
