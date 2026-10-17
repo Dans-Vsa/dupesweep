@@ -6,11 +6,13 @@ import argparse
 import json
 import sys
 import time
+import os
 from collections.abc import Sequence
 from pathlib import Path
 
 from dupesweep import __version__
 from dupesweep import cleaner, report
+from dupesweep.cache import HashCache, default_cache_path
 from dupesweep.finder import DuplicateGroup, FindStats, find_duplicates
 from dupesweep.scanner import ScanOptions, ScanStats, iter_files
 from dupesweep.sizes import format_size, parse_size
@@ -52,6 +54,47 @@ def _add_scan_filters(parser: argparse.ArgumentParser) -> None:
     )
 
 
+DEFAULT_JOBS = min(8, os.cpu_count() or 1)
+
+
+def _add_hash_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-j", "--jobs", type=int, default=DEFAULT_JOBS, metavar="N",
+        help=f"hash N files in parallel (default: {DEFAULT_JOBS})",
+    )
+    parser.add_argument(
+        "--cache", nargs="?", const=str(default_cache_path()), default=None, metavar="FILE",
+        help="reuse hashes of unchanged files from an SQLite cache "
+        f"(default file: {default_cache_path()})",
+    )
+    progress = parser.add_mutually_exclusive_group()
+    progress.add_argument(
+        "--progress", dest="progress", action="store_true", default=None,
+        help="show hashing progress on stderr (default: only in an interactive terminal)",
+    )
+    progress.add_argument(
+        "--no-progress", dest="progress", action="store_false", help="never show progress"
+    )
+
+
+class _Progress:
+    """Single-line progress on stderr: ``hashing partial  120/500``."""
+
+    def __init__(self, stream=None):
+        self.stream = stream or sys.stderr
+        self._last = None
+
+    def __call__(self, stage: str, done: int, total: int) -> None:
+        key = (stage, done * 50 // total)  # redraw at most ~50 times per stage
+        if key == self._last and done != total:
+            return
+        self._last = key
+        self.stream.write(f"\rhashing {stage:<7} {done:>{len(str(total))}}/{total}")
+        if done == total:
+            self.stream.write("\n")
+        self.stream.flush()
+
+
 def _options_from_args(args: argparse.Namespace) -> ScanOptions:
     options = ScanOptions(
         min_size=args.min_size,
@@ -84,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     find = sub.add_parser("find", help="list groups of duplicate files and the space they waste")
     _add_scan_filters(find)
+    _add_hash_options(find)
     find.add_argument(
         "--sort", choices=report.SORT_KEYS, default="wasted",
         help="order of the groups (default: wasted space)",
@@ -109,6 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
         "clean", help="remove, hard-link or quarantine duplicates (dry run unless --yes)"
     )
     _add_scan_filters(clean)
+    _add_hash_options(clean)
     clean.add_argument(
         "--action", choices=cleaner.ACTIONS, default="quarantine",
         help="what to do with the extra copies (default: quarantine = move them away)",
@@ -137,6 +182,14 @@ def build_parser() -> argparse.ArgumentParser:
     undo.add_argument("log", help="the .jsonl log written by clean")
     undo.add_argument("-y", "--yes", action="store_true", help="actually restore the files")
     undo.set_defaults(func=cmd_undo)
+
+    cache = sub.add_parser("cache", help="inspect or maintain the hash cache")
+    cache.add_argument("action", choices=("info", "prune", "clear"))
+    cache.add_argument(
+        "--cache", default=str(default_cache_path()), metavar="FILE",
+        help="cache file (default: %(default)s)",
+    )
+    cache.set_defaults(func=cmd_cache)
     return parser
 
 
@@ -193,7 +246,16 @@ def _scan_and_find(args: argparse.Namespace) -> tuple[ScanStats, FindStats, list
     scan_stats = ScanStats()
     entries = list(iter_files(args.paths, _options_from_args(args), scan_stats))
     find_stats = FindStats()
-    groups = find_duplicates(entries, find_stats)
+    show_progress = args.progress if args.progress is not None else sys.stderr.isatty()
+    options = {
+        "jobs": max(1, args.jobs),
+        "progress": _Progress() if show_progress else None,
+    }
+    if args.cache:
+        with HashCache(args.cache) as cache:
+            groups = find_duplicates(entries, find_stats, cache=cache, **options)
+    else:
+        groups = find_duplicates(entries, find_stats, **options)
     return scan_stats, find_stats, groups
 
 
@@ -274,6 +336,7 @@ def cmd_find(args: argparse.Namespace) -> int:
                 "partial_hashed": find_stats.partial_hashed,
                 "full_hashed": find_stats.full_hashed,
                 "bytes_fully_hashed": find_stats.bytes_hashed,
+                "cache_hits": find_stats.cache_hits,
             },
             "errors": errors,
         }
@@ -395,6 +458,23 @@ def cmd_undo(args: argparse.Namespace) -> int:
     else:
         print(f"Dry run: {ok} of {len(outcomes)} file(s) can be restored. Re-run with --yes.")
     return 0 if ok == len(outcomes) else 1
+
+
+def cmd_cache(args: argparse.Namespace) -> int:
+    path = Path(args.cache)
+    if args.action != "clear" and not path.exists():
+        print(f"No cache at {path} yet (it is created by find/clean --cache).")
+        return 0
+    with HashCache(path) as cache:
+        if args.action == "info":
+            size = path.stat().st_size
+            print(f"Cache: {path}\nEntries: {len(cache)}\nSize: {format_size(size)}")
+        elif args.action == "prune":
+            print(f"Removed {cache.prune()} entries for files that no longer exist.")
+        else:
+            cache.clear()
+            print(f"Cleared {path}.")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
