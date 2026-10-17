@@ -13,6 +13,7 @@ from pathlib import Path
 from dupesweep import __version__
 from dupesweep import cleaner, report
 from dupesweep.cache import HashCache, default_cache_path
+from dupesweep.config import Config, ConfigError, load_config, user_config_path
 from dupesweep.finder import DuplicateGroup, FindStats, find_duplicates
 from dupesweep.scanner import ScanOptions, ScanStats, iter_files
 from dupesweep.sizes import format_size, parse_size
@@ -109,12 +110,23 @@ def _options_from_args(args: argparse.Namespace) -> ScanOptions:
     return options
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _add_config_options(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--config", metavar="FILE",
+        help=f"read defaults from FILE (default: ./dupesweep.toml or {user_config_path()})",
+    )
+    group.add_argument("--no-config", action="store_true", help="ignore configuration files")
+
+
+def build_parser(config: Config | None = None) -> argparse.ArgumentParser:
+    config = config or Config()
     parser = argparse.ArgumentParser(
         prog="dupesweep",
         description="Find and safely clean up duplicate files.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    _add_config_options(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="walk directories and summarise the files found")
@@ -123,6 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--top", type=int, default=5, metavar="N", help="show the N largest files (default: 5)"
     )
     scan.add_argument("--json", action="store_true", help="print the summary as JSON")
+    scan.set_defaults(**config.for_command("scan"))
     scan.set_defaults(func=cmd_scan)
 
     find = sub.add_parser("find", help="list groups of duplicate files and the space they waste")
@@ -147,6 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--fail-on-dupes", action="store_true",
         help="exit with status 1 when duplicates are found (useful in CI)",
     )
+    find.set_defaults(**config.for_command("find"))
     find.set_defaults(func=cmd_find)
 
     clean = sub.add_parser(
@@ -176,6 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
         "quarantine dir, or the current dir for other actions)",
     )
     clean.add_argument("-y", "--yes", action="store_true", help="actually apply the changes")
+    clean.set_defaults(**config.for_command("clean"))
     clean.set_defaults(func=cmd_clean)
 
     undo = sub.add_parser("undo", help="restore files recorded in a clean log")
@@ -190,6 +205,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="cache file (default: %(default)s)",
     )
     cache.set_defaults(func=cmd_cache)
+
+    show = sub.add_parser("config", help="show which config file is used and its values")
+    show.set_defaults(func=cmd_config, config_obj=config)
     return parser
 
 
@@ -477,8 +495,30 @@ def cmd_cache(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config(args: argparse.Namespace) -> int:
+    config: Config = args.config_obj
+    if config.path is None:
+        print("No config file found. Looked for ./dupesweep.toml and", user_config_path())
+        return 0
+    print(f"Config: {config.path}")
+    for command, values in config.defaults.items():
+        if values:
+            print(f"[{command}]")
+            for dest, value in sorted(values.items()):
+                print(f"  {dest} = {value!r}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
+    pre = argparse.ArgumentParser(add_help=False)
+    _add_config_options(pre)
+    known, _ = pre.parse_known_args(argv)
+    try:
+        config = Config() if known.no_config else load_config(known.config)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    parser = build_parser(config)
     args = parser.parse_args(argv)
     return args.func(args)
 
