@@ -4,6 +4,7 @@ import sys
 
 import pytest
 
+from conftest import write
 from dupesweep import __version__
 from dupesweep.cli import main
 
@@ -79,3 +80,48 @@ def test_python_dash_m_entry_point(sample_tree):
         check=True,
     )
     assert json.loads(result.stdout)["files"] == 4
+
+
+@pytest.fixture
+def dupes(tmp_path):
+    write(tmp_path / "one.txt", "same content")
+    write(tmp_path / "two.txt", "same content")
+    write(tmp_path / "nested" / "three.txt", "same content")
+    write(tmp_path / "photo.jpg", b"JPEG" * 100)
+    write(tmp_path / "backup" / "photo.jpg", b"JPEG" * 100)
+    write(tmp_path / "other.txt", "different!!!")
+    return tmp_path
+
+
+def test_find_text_output(dupes, capsys):
+    assert main(["find", str(dupes)]) == 0
+    out = capsys.readouterr().out
+    assert "Group 1: 2 files x 400 B  (400 B wasted)" in out
+    assert "Group 2: 3 files x 12 B  (24 B wasted)" in out
+    assert "Found 2 duplicate group(s): 3 redundant file(s), 424 B wasted (scanned 6 files)." in out
+
+
+def test_find_json_output(dupes, capsys):
+    assert main(["find", str(dupes), "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["groups"] == 2
+    assert data["duplicate_files"] == 3
+    assert data["wasted_bytes"] == 424
+    assert data["duplicates"][1]["count"] == 3
+    assert data["hashing"]["size_candidates"] == 6
+
+
+def test_find_respects_scan_filters(dupes, capsys):
+    assert main(["find", str(dupes), "--include", "*.txt", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["groups"] == 1 and data["duplicates"][0]["size"] == 12
+
+
+def test_find_without_duplicates(tmp_path, capsys):
+    (tmp_path / "a").write_text("1")
+    assert main(["find", str(tmp_path)]) == 0
+    assert "No duplicates found (scanned 1 files)." in capsys.readouterr().out
+
+
+def test_find_min_larger_than_max(dupes, capsys):
+    assert main(["find", str(dupes), "--min-size", "2KB", "--max-size", "1KB"]) == 2
