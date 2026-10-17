@@ -23,3 +23,12 @@ def sample_tree(tmp_path: Path) -> Path:
     write(tmp_path / ".dotfile", "dot")
     write(tmp_path / "node_modules" / "pkg" / "index.js", "module.exports = 1")
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def isolated_user_dirs(tmp_path, monkeypatch):
+    """Never read the developer's real config file or write to the real cache dir."""
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "appdata"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "localappdata"))
