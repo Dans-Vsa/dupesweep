@@ -5,7 +5,9 @@ reclaiming wasted disk space. It walks your folders, groups files by size,
 confirms duplicates by content hash, and lets you safely delete,
 hard-link or quarantine the extra copies — with an undo log.
 
-> Status: **early development** — milestone 5 of 6 (hash cache, parallel hashing, progress) is done.
+[![CI](https://github.com/Dans-Vsa/dupesweep/actions/workflows/ci.yml/badge.svg)](https://github.com/Dans-Vsa/dupesweep/actions/workflows/ci.yml)
+
+> Status: **v1.0.0** — all planned features are done. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Features
 
@@ -25,11 +27,12 @@ hard-link or quarantine the extra copies — with an undo log.
 - [x] `undo`: restore quarantined files and turn hard links back into copies from the JSON Lines log
 - [x] SQLite hash cache (`--cache`; reused while path, size and mtime are unchanged) with `cache info|prune|clear`
 - [x] Parallel hashing (`--jobs N`) and a progress line on stderr (automatic in a terminal, `--progress` / `--no-progress`)
-- [ ] Config file and packaged release
+- [x] TOML config file with per-command defaults (`./dupesweep.toml` or a user config), `dupesweep config` to inspect it
+- [x] Tested on Linux and Windows (GitHub Actions, Python 3.11–3.13)
 
 ## Tech stack
 
-- Python 3.10+ (standard library only at runtime)
+- Python 3.11+ (standard library only at runtime: `argparse`, `os.scandir`, `hashlib`, `sqlite3`, `tomllib`, `concurrent.futures`)
 - `argparse` CLI, `os.scandir`-based walker
 - `pytest` for tests
 
@@ -141,6 +144,31 @@ The text report ends with a breakdown such as `Wasted by type: .jpg 1.2 GB, .mp4
 - `dupesweep cache info` shows the entry count, `prune` forgets deleted files, `clear` empties it.
 - `find --json` reports `hashing.cache_hits`.
 
+### Configuration file
+
+Put defaults in `dupesweep.toml` in the current folder, or in the user config file (`%APPDATA%\dupesweep\config.toml` on Windows, `~/.config/dupesweep/config.toml` elsewhere). Command-line options always win; `--config FILE` picks another file and `--no-config` ignores them all.
+
+```toml
+[defaults]                 # scan, find and clean
+min_size = "10KB"
+exclude = ["*.tmp", "Thumbs.db", "desktop.ini"]
+exclude_dir = [".git", "node_modules", ".venv", "build"]
+jobs = 4
+cache = true               # or a file path
+
+[find]
+sort = "wasted"
+limit = 50
+
+[clean]
+action = "quarantine"
+keep = "oldest"
+keep_in = ["~/Pictures/Best"]
+quarantine_dir = "~/dupes-quarantine"
+```
+
+Supported keys: `min_size`, `max_size`, `include`, `exclude`, `exclude_dir`, `hidden`, `follow_symlinks` (all commands); `jobs`, `cache`, `progress` (find, clean); `top` (scan); `sort`, `limit`, `format`, `fail_on_dupes` (find); `action`, `keep`, `keep_in`, `quarantine_dir` (clean). Unknown keys or values are reported as errors, so typos never pass silently. Run `dupesweep config` to see what is loaded.
+
 ### How duplicates are confirmed
 
 1. **Size** — files with a unique size cannot have a twin and are never opened.
@@ -167,12 +195,15 @@ dupesweep/
 │   ├── cache.py        # SQLite hash cache
 │   ├── cleaner.py      # keep rules, quarantine/hardlink/delete, undo log
 │   ├── cli.py          # argparse commands
+│   ├── config.py       # TOML config loading and validation
 │   ├── finder.py       # size -> partial -> full hash grouping
 │   ├── hasher.py       # partial and full BLAKE2b hashing
 │   ├── report.py       # sorting, summary, JSON/CSV export
 │   ├── scanner.py      # filesystem walker + filters
 │   └── sizes.py        # parse/format human-readable sizes
 ├── tests/              # pytest suite
+├── .github/workflows/ci.yml
+├── CHANGELOG.md
 ├── pyproject.toml
 └── LICENSE
 ```
