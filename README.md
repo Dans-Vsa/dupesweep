@@ -5,7 +5,7 @@ reclaiming wasted disk space. It walks your folders, groups files by size,
 confirms duplicates by content hash, and lets you safely delete,
 hard-link or quarantine the extra copies — with an undo log.
 
-> Status: **early development** — milestone 4 of 6 (safe clean-up + undo) is done.
+> Status: **early development** — milestone 5 of 6 (hash cache, parallel hashing, progress) is done.
 
 ## Features
 
@@ -23,7 +23,8 @@ hard-link or quarantine the extra copies — with an undo log.
       (`first`, `oldest`, `newest`, `shortest`, `longest` path, `--keep-in DIR`);
       **dry run by default**, `--yes` to apply; every file is re-hashed right before it is touched
 - [x] `undo`: restore quarantined files and turn hard links back into copies from the JSON Lines log
-- [ ] Hash cache (SQLite) and parallel hashing with progress output
+- [x] SQLite hash cache (`--cache`; reused while path, size and mtime are unchanged) with `cache info|prune|clear`
+- [x] Parallel hashing (`--jobs N`) and a progress line on stderr (automatic in a terminal, `--progress` / `--no-progress`)
 - [ ] Config file and packaged release
 
 ## Tech stack
@@ -60,6 +61,10 @@ dupesweep find . --json > dupes.json
 dupesweep find ~/Music --sort count --limit 20          # groups with the most copies
 dupesweep find ~/Data -o reports/dupes.csv             # one CSV row per file
 dupesweep find ./assets --fail-on-dupes --min-size 10KB  # fail a CI job on duplicates
+
+# Big folders: 8 hashing threads and a persistent cache for the next run
+dupesweep find /mnt/archive --jobs 8 --cache
+dupesweep cache info
 
 # Preview a clean-up (nothing changes without --yes)
 dupesweep clean ~/Pictures --keep oldest
@@ -129,6 +134,13 @@ The text report ends with a breakdown such as `Wasted by type: .jpg 1.2 GB, .mp4
 - The log (`--log FILE`, default `dupesweep-log-<timestamp>.jsonl` in the quarantine dir or current dir) has one JSON object per handled file: `time, action, path, keep, target, size, digest`.
 - Files that are already inside the quarantine dir are never treated as duplicates.
 
+### Speed: cache and threads
+
+- `--jobs N` hashes N files at a time (default: number of CPUs, max 8). Hashing is I/O bound and `hashlib` releases the GIL, so threads help most on SSDs and network drives.
+- `--cache` stores partial and full hashes in SQLite (default `%LOCALAPPDATA%\dupesweep\hashes.sqlite` on Windows, `$XDG_CACHE_HOME/dupesweep/hashes.sqlite` or `~/.cache/dupesweep/hashes.sqlite` elsewhere; pass `--cache FILE` for another location). A cached hash is used only if the file's size and mtime still match.
+- `dupesweep cache info` shows the entry count, `prune` forgets deleted files, `clear` empties it.
+- `find --json` reports `hashing.cache_hits`.
+
 ### How duplicates are confirmed
 
 1. **Size** — files with a unique size cannot have a twin and are never opened.
@@ -152,6 +164,7 @@ dupesweep/
 ├── src/dupesweep/
 │   ├── __init__.py     # package version
 │   ├── __main__.py     # `python -m dupesweep`
+│   ├── cache.py        # SQLite hash cache
 │   ├── cleaner.py      # keep rules, quarantine/hardlink/delete, undo log
 │   ├── cli.py          # argparse commands
 │   ├── finder.py       # size -> partial -> full hash grouping
